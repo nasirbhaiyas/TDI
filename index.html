@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TDI Billing Assistant</title>
+    
+    <!-- Tailwind CSS for Styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- React & ReactDOM for Logic -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    
+    <!-- Babel for JSX Compilation in Browser -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <style>
+        body { font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif; }
+    </style>
+</head>
+<body class="bg-slate-100">
+
+    <!-- This is where the React app will be rendered -->
+    <div id="root"></div>
+
+    <!-- The actual application logic -->
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        const TdiDashboard = () => {
+          // Initial Input States
+          const [eobData, setEobData] = useState("");
+          const [offerData, setOfferData] = useState("");
+          const [fairHealthData, setFairHealthData] = useState("");
+
+          // Secret Popup State
+          const [secretPopup, setSecretPopup] = useState(false);
+          const [secretData, setSecretData] = useState({
+            date: `${(new Date().getMonth() + 1).toString().padStart(2, '0')}/${new Date().getDate().toString().padStart(2, '0')}/${new Date().getFullYear().toString().slice(-2)}`,
+            initial: 'NASIR U',
+            ticketCaseMapping: '' 
+          });
+          const keySequence = useRef('');
+
+          // Extracted Data State
+          const [extracted, setExtracted] = useState({
+            ticket: '', case: '', claimNo: '', totalBill: '',
+            obsBill: '', withoutObsMed: '', initialPaid: '',
+            offerAmount: '', addOffer: '', npi: '', taxId: '', address: '', isPoBox: false, serviceCodes: '', patResp: '', patientShare: '', fairHealth80th: ''
+          });
+
+          const [generatedNote, setGeneratedNote] = useState('');
+          const [noteType, setNoteType] = useState('default');
+          
+          // Custom Notification System
+          const [notifications, setNotifications] = useState([]);
+          const lastGCodeRef = useRef(null);
+          const lastNegativeOfferRef = useRef(null);
+
+          // Excel Modal States
+          const [showOfferModal, setShowOfferModal] = useState(false);
+          const [showFairHealthModal, setShowFairHealthModal] = useState(false);
+
+          const addNotification = (message, type = 'success') => {
+            const id = Date.now() + Math.random();
+            setNotifications(prev => [...prev, { id, message, type }]);
+            
+            setTimeout(() => {
+              setNotifications(prev => prev.filter(n => n.id !== id));
+            }, 4000);
+          };
+
+          // Secret Code Keyboard Listener ("admin")
+          useEffect(() => {
+            const handleKeyDown = (e) => {
+              if (e.key.length === 1) { 
+                keySequence.current += e.key.toLowerCase();
+                if (keySequence.current.length > 10) {
+                  keySequence.current = keySequence.current.slice(-10);
+                }
+                if (keySequence.current.includes('admin')) {
+                  setSecretPopup(true);
+                  keySequence.current = ''; 
+                }
+              }
+            };
+            window.addEventListener('keydown', handleKeyDown);
+            return () => window.removeEventListener('keydown', handleKeyDown);
+          }, []);
+
+          // Extraction Logic
+          useEffect(() => {
+            const combineText = `${eobData}\n${offerData}\n${fairHealthData}`;
+            
+            const extractField = (regex, fallback = '') => {
+              const match = combineText.match(regex);
+              return match ? match[1].trim() : fallback;
+            };
+
+            const hcpcsMatches = [...combineText.matchAll(/HCPCS[\s\n]+([A-Z0-9]{4,5})/gi)];
+            
+            // Filter A, J, Q, and G codes
+            const collectedServiceCodes = hcpcsMatches
+              .map(m => m[1].toUpperCase())
+              .filter(code => !code.startsWith('A') && !code.startsWith('J') && !code.startsWith('Q') && !code.startsWith('G')) 
+              .join(', ');
+
+            let extractedObsBill = extractField(/Observation Bill:\s*\$?([\d,.]+)/i);
+            let foundGCode = null;
+            let calculatedWithoutObsMed = 0;
+            
+            const availityLineRegex = /\$([\d,.]+)\s+\$([\d,.]+)[\s\S]{1,200}?HCPCS[\s\n]+([A-Z0-9]{4,5})/gi;
+            const lineItems = [...combineText.matchAll(availityLineRegex)];
+            const hasLineItems = lineItems.length > 0;
+            
+            for (const item of lineItems) {
+              const code = item[3].toUpperCase();
+              const billedAmt = parseFloat(item[2].replace(/,/g, ''));
+              
+              if (code.startsWith('G')) {
+                extractedObsBill = item[2]; 
+                foundGCode = code;
+              } else if (!code.startsWith('A') && !code.startsWith('J') && !code.startsWith('Q')) {
+                if (!isNaN(billedAmt)) {
+                  calculatedWithoutObsMed += billedAmt;
+                }
+              }
+            }
+
+            if (!extractedObsBill) {
+              const adjacentGMatch = combineText.match(/(G\d{4})[\s\n-]+\$?([\d,.]+)/i) || combineText.match(/\$?([\d,.]+)[\s\n-]+(G\d{4})/i);
+              if (adjacentGMatch) {
+                 foundGCode = adjacentGMatch[1].startsWith('G') ? adjacentGMatch[1] : adjacentGMatch[2];
+                 extractedObsBill = adjacentGMatch[1].startsWith('G') ? adjacentGMatch[2] : adjacentGMatch[1];
+              }
+            }
+
+            if (foundGCode && foundGCode !== lastGCodeRef.current) {
+                addNotification(`Observation Code (${foundGCode}) Detected!`, 'error');
+                lastGCodeRef.current = foundGCode;
+            } else if (!foundGCode && combineText.trim() === "") {
+                lastGCodeRef.current = null; 
+            }
+
+            const coinsuranceStr = extractField(/Coinsurance Amount[\s\t]*\$?([\d,.]+)/i);
+            const deductibleStr = extractField(/Deductible Amount[\s\t]*\$?([\d,.]+)/i);
+            const coinsurance = parseFloat((coinsuranceStr || '0').replace(/,/g, ''));
+            const deductible = parseFloat((deductibleStr || '0').replace(/,/g, ''));
+            const calcPatientShare = (coinsurance + deductible).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+            let claimNoParsed = extractField(/Claim Number[\s\t]*([A-Za-z0-9]+)/i) || extractField(/Claim No:\s*([A-Za-z0-9-]+)/i) || extractField(/Claim #:\s*([A-Za-z0-9-]+)/i);
+            let ticketParsed = extractField(/Patient Account Number[\s\t\n]+([A-Za-z0-9-]+)/i) || extractField(/Ticket:\s*([A-Za-z0-9-]+)/i);
+            
+            let caseNoParsed = '';
+            if (ticketParsed && secretData.ticketCaseMapping.trim()) {
+              const lines = secretData.ticketCaseMapping.split('\n');
+              for (const line of lines) {
+                if (line.toUpperCase().includes(ticketParsed.toUpperCase())) {
+                  const cells = line.split('\t'); 
+                  const foundIndex = cells.findIndex(c => c.toUpperCase().includes(ticketParsed.toUpperCase()));
+                  if (foundIndex !== -1 && cells.length > 1) {
+                     caseNoParsed = (foundIndex === 0 ? cells[1] : cells[0]).trim();
+                  } else {
+                     const parts = line.split(/[\s,]+/);
+                     const casePart = parts.find(p => p.toUpperCase() !== ticketParsed.toUpperCase() && p.trim() !== '');
+                     if (casePart) caseNoParsed = casePart;
+                  }
+                  break;
+                }
+              }
+            }
+            
+            if (!caseNoParsed) {
+              caseNoParsed = extractField(/Case:\s*([A-Za-z0-9-]+)/i);
+            }
+
+            let matchedOfferAmt = extractField(/Offer Amount:\s*\$?([\d,.]+)/i); 
+            if (offerData.trim() && (caseNoParsed || claimNoParsed)) {
+              const lines = offerData.split('\n');
+              for (const line of lines) {
+                if ((caseNoParsed && line.includes(caseNoParsed)) || (claimNoParsed && line.includes(claimNoParsed))) {
+                  const matches = [...line.matchAll(/\$?([\d,.]+)/g)];
+                  if (matches.length > 0) {
+                    matchedOfferAmt = matches[matches.length - 1][1];
+                  }
+                  break;
+                }
+              }
+            }
+
+            // Fair Health 80th Calculation
+            let fairHealthTotal = 0;
+            const activeServiceCodesList = collectedServiceCodes.split(', ').map(c => c.trim()).filter(c => c);
+
+            if (fairHealthData.trim() && activeServiceCodesList.length > 0) {
+              const fhLines = fairHealthData.split('\n');
+              
+              let headerRowIndex = -1;
+              let codeIdx = -1;
+              let eightyIdx = -1;
+
+              for (let i = 0; i < Math.min(20, fhLines.length); i++) {
+                const headers = fhLines[i].split('\t').map(h => h.trim().toLowerCase());
+                const tempCodeIdx = headers.findIndex(h => h === 'code' || h === 'cpt code' || h === 'procedure code');
+                const tempEightyIdx = headers.findIndex(h => h === '80th' || h.includes('80th'));
+
+                if (tempCodeIdx !== -1 && tempEightyIdx !== -1) {
+                  headerRowIndex = i;
+                  codeIdx = tempCodeIdx;
+                  eightyIdx = tempEightyIdx;
+                  break;
+                }
+              }
+
+              if (headerRowIndex !== -1 && codeIdx !== -1 && eightyIdx !== -1) {
+                for (let i = headerRowIndex + 1; i < fhLines.length; i++) {
+                  const cells = fhLines[i].split('\t');
+                  if (cells.length > Math.max(codeIdx, eightyIdx)) {
+                    const rowCode = cells[codeIdx].trim().toUpperCase();
+                    if (activeServiceCodesList.includes(rowCode)) {
+                      const rawAmount = cells[eightyIdx].replace(/[^0-9.-]+/g, '');
+                      const amount = parseFloat(rawAmount);
+                      if (!isNaN(amount)) {
+                        fairHealthTotal += amount;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+
+            const initialPaidStr = extractField(/(?:^|\n)\s*(?:Insurance )?Paid Amount[\s\n:]*\$?([\d,.]+)/i) || extractField(/Initial Paid[\s\n:]*\$?([\d,.]+)/i);
+            const initialPaidNum = parseFloat((initialPaidStr || '0').replace(/,/g, ''));
+            const offerAmtNum = parseFloat((matchedOfferAmt || '0').replace(/,/g, ''));
+            const patientShareNum = parseFloat((calcPatientShare || '0').replace(/,/g, ''));
+            
+            const calcAddOfferNum = offerAmtNum - (initialPaidNum + patientShareNum);
+            const calcAddOfferAbsoluteStr = Math.abs(calcAddOfferNum).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            const addOfferFormattedStr = calcAddOfferNum < 0 ? `-$${calcAddOfferAbsoluteStr}` : `$${calcAddOfferAbsoluteStr}`;
+
+            const currentId = claimNoParsed || ticketParsed;
+            if (calcAddOfferNum < 0 && matchedOfferAmt && currentId && currentId !== lastNegativeOfferRef.current) {
+                addNotification("YOU NEED TO LOOK THE OFFER.", 'error');
+                lastNegativeOfferRef.current = currentId;
+            } else if (calcAddOfferNum >= 0 && currentId) {
+                lastNegativeOfferRef.current = null;
+            }
+
+            const parsedData = {
+              ticket: ticketParsed,
+              case: caseNoParsed,
+              claimNo: claimNoParsed,
+              totalBill: extractField(/(?:Billed Amount|Total Bill|Total Charge|Total Charges)[\s\n:]*\$?([\d,.]+)/i),
+              obsBill: extractedObsBill,
+              withoutObsMed: hasLineItems ? calculatedWithoutObsMed.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : extractField(/Without Obs & Med[\s\n:]*\$?([\d,.]+)/i),
+              initialPaid: initialPaidStr,
+              patResp: calcPatientShare,
+              patientShare: calcPatientShare,
+              offerAmount: matchedOfferAmt,
+              addOfferFormatted: addOfferFormattedStr,
+              addOffer: calcAddOfferNum.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+              npi: extractField(/NPI:\s*(\d{10})/i),
+              taxId: extractField(/Tax ID:\s*([\d-]+)/i) || extractField(/EIN:\s*([\d-]+)/i),
+              address: extractField(/Address:\s*(.*)/i),
+              serviceCodes: collectedServiceCodes,
+              fairHealth80th: fairHealthTotal > 0 ? fairHealthTotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '0.00'
+            };
+
+            parsedData.isPoBox = /p\.?\s*o\.?\s*box\s*\d+/i.test(combineText);
+
+            setExtracted(parsedData);
+
+            const dateStr = secretData.date;
+            const initialStr = secretData.initial;
+            
+            let baseNoteTemplate = "";
+            switch (noteType) {
+              case 'different_plan':
+                baseNoteTemplate = `${dateStr}>FINAL REVIEW>${initialStr}>WORKING ON TDI TRACKING SHEET. CLAIM NO.#[CLAIM NO], TOTAL CHARGE $[TOTAL BILL], INS PAID $[INITIAL PAID], PATIENT RESPONSIBILITY $[PAT RESP]. CLOSED AS INELIGIBLE BY TDI. THE SERVICES BILLED WERE NOT COVERED UNDER THE PLAN. NO FURTHER ACTION IS PERMITTED. THE REMAINING BALANCE SHOULD BE ADJUSTED ACCORDINGLY.`;
+                break;
+              case 'accepted':
+                baseNoteTemplate = `${dateStr}>FINAL REVIEW>${initialStr}>WORKING ON TDI TRACKING SHEET. CLAIM NO#[CLAIM NO], TOTAL CHARGE $[TOTAL BILL], INS PAID $[INITIAL PAID], PATIENT RESPONSIBILITY $[PAT RESP]. NEGOTIATED AMOUNT OF $[OFFER AMOUNT] WAS ACCEPTED. ADDITIONAL PAYMENT OF $[ADD OFFER] WAS RECEIVED FROM BCBS. NO FURTHER ACTION NEEDED AT THIS TIME. BALANCE TO BE ADJUSTED ACCORDINGLY.`;
+                break;
+              case 'withdrawn':
+                baseNoteTemplate = `${dateStr}>FINAL REVIEW>${initialStr}>WORKING ON TDI TRACKING SHEET. CLAIM NO.#[CLAIM NO], TOTAL CHARGE $[TOTAL BILL], INS PAID $[INITIAL PAID], PATIENT RESPONSIBILITY $[PAT RESP]. THIS ACCOUNT HAS BEEN WITHDRAWN FROM TDI CONSIDERATION. NO FURTHER ACTION IS PERMITTED. THE REMAINING BALANCE SHOULD BE ADJUSTED ACCORDINGLY.`;
+                break;
+              case 'out_of_state':
+                baseNoteTemplate = `${dateStr}>FINAL REVIEW>${initialStr}>WORKING ON TDI TRACKING SHEET. CLAIM NO.#[CLAIM NO], TOTAL CHARGE $[TOTAL BILL], INS PAID $[INITIAL PAID], PATIENT RESPONSIBILITY $[PAT RESP]. THIS ACCOUNT WAS REJECTED BECAUSE THIS PATIENT BELONGS TO OUT OF STATE PLAN. THIS ACCOUNT IS NOT ELIGIBLE FOR TDI. NO FURTHER ACTION ALLOWED TO BE TAKEN. BALANCE TO BE ADJUSTED ACCORDINGLY.`;
+                break;
+              default:
+                baseNoteTemplate = `${dateStr}>FOLLOW-UP>${initialStr}>WORKING ON COLLECTORS WORKLIST. CLAIM NO #[CLAIM NO], TICKET #[TICKET], TOTAL BILL $[TOTAL BILL], EMAILED FRONT OFFICE TO CHECK TDI INFORMATION. NO UPDATE RECEIVED YET. WAITING ON FO RESPONSE TO COMPLETE THE NEXT WORK. PUTTING ON HOLD UNTIL FO REPLIES.`;
+            }
+
+            let newNote = baseNoteTemplate;
+            newNote = newNote.replace(/\[CLAIM NO\]/gi, parsedData.claimNo || '____');
+            newNote = newNote.replace(/\[TICKET\]/gi, parsedData.ticket || '____');
+            newNote = newNote.replace(/\[TOTAL BILL\]/gi, parsedData.totalBill || '0.00');
+            newNote = newNote.replace(/\[INITIAL PAID\]/gi, parsedData.initialPaid || '0.00');
+            newNote = newNote.replace(/\[PAT RESP\]/gi, parsedData.patResp || '0.00');
+            newNote = newNote.replace(/\[OFFER AMOUNT\]/gi, parsedData.offerAmount || '0.00');
+            newNote = newNote.replace(/\$\[ADD OFFER\]/gi, parsedData.addOfferFormatted || '$0.00'); 
+            newNote = newNote.replace(/\[ADD OFFER\]/gi, parsedData.addOffer || '0.00'); 
+            
+            setGeneratedNote(newNote);
+
+          }, [eobData, offerData, fairHealthData, noteType, secretData]);
+
+          const copyTableData = () => {
+            const headers = ["Ticket", "Case", "Claim No", "Total Bill", "Observation Bill", "Without Obs & Med", "Initial Paid", "Patient Share", "Offer Amount", "Additional Offer"];
+            const row = [extracted.ticket, extracted.case, extracted.claimNo, extracted.totalBill, extracted.obsBill, extracted.withoutObsMed, extracted.initialPaid, extracted.patientShare, extracted.offerAmount, extracted.addOfferFormatted];
+            
+            const tsvData = headers.join('\t') + '\n' + row.join('\t');
+            navigator.clipboard.writeText(tsvData).then(() => {
+              addNotification("📊 Table Data Copied to Clipboard!");
+            });
+          };
+
+          const copyNoteData = () => {
+            navigator.clipboard.writeText(generatedNote).then(() => {
+              addNotification("📝 Follow-up Note Copied!");
+            });
+          };
+
+          const CopyIcon = () => (
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+          );
+          const CheckIcon = () => (
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+          );
+          const AlertIcon = () => (
+            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-amber-500"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+          );
+          const ExcelIcon = () => (
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-green-700"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><path d="M8 13h2"/><path d="M8 17h2"/><path d="M14 13h2"/><path d="M14 17h2"/></svg>
+          );
+          const ExcelBlueIcon = () => (
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-blue-700"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><path d="M8 13h2"/><path d="M8 17h2"/><path d="M14 13h2"/><path d="M14 17h2"/></svg>
+          );
+
+          return (
+            <div className="min-h-screen p-4 md:p-6 font-sans">
+              
+              <style>{`
+                .notification-float {
+                  animation: slowFloatUp 4s ease-in-out forwards;
+                }
+                @keyframes slowFloatUp {
+                  0% { opacity: 0; transform: translateY(20px) scale(0.9); }
+                  15% { opacity: 1; transform: translateY(-20px) scale(1); }
+                  80% { opacity: 1; transform: translateY(-120px) scale(1); }
+                  100% { opacity: 0; transform: translateY(-180px) scale(0.95); }
+                }
+              `}</style>
+
+              <div className="fixed inset-0 pointer-events-none flex flex-col items-center justify-center z-50">
+                {notifications.map(note => (
+                  <div key={note.id} className={`notification-float absolute text-white px-6 py-4 rounded-xl shadow-2xl font-semibold flex items-center gap-3 text-lg border ${note.type === 'error' ? 'bg-red-600 border-red-700' : 'bg-slate-800 border-slate-600'}`}>
+                     {note.type === 'success' ? <CheckIcon /> : <AlertIcon />}
+                     {note.message}
+                  </div>
+                ))}
+              </div>
+
+              <div className="max-w-[1400px] mx-auto">
+                <header className="mb-6 pb-4 border-b border-slate-300">
+                  <h1 className="text-2xl md:text-3xl font-bold text-slate-800 flex items-center gap-2">
+                    TDI Billing Assistant
+                  </h1>
+                  <p className="text-slate-500 mt-1 text-sm">Automate your data extraction and follow-up notes effortlessly.</p>
+                </header>
+
+                <div className="flex flex-col xl:flex-row gap-6 h-full items-start">
+                  
+                  {/* Left Panel: Inputs */}
+                  <div className="xl:w-1/3 flex flex-col gap-4 w-full">
+                    <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden flex flex-col flex-grow">
+                      <div className="bg-slate-50 border-b border-slate-200 px-3 py-2 flex justify-between items-center">
+                        <h2 className="font-semibold text-slate-700 text-sm">1️⃣ EOB Data (Availity / Portal)</h2>
+                        <button onClick={() => setEobData('')} className="text-xs text-red-500 hover:text-red-700 font-medium">Clear</button>
+                      </div>
+                      <textarea
+                        className="w-full h-64 p-3 text-xs text-slate-700 focus:ring-1 focus:ring-blue-500 focus:outline-none resize-none font-mono"
+                        placeholder="Paste EOB details directly from Availity here..."
+                        value={eobData}
+                        onChange={(e) => setEobData(e.target.value)}
+                      />
+                    </div>
+
+                    <div className="flex gap-4">
+                      {/* Box 2: Offer Sheet Modal Trigger */}
+                      <div 
+                        onClick={() => setShowOfferModal(true)}
+                        className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden flex flex-col w-1/2 cursor-pointer hover:border-green-400 hover:shadow-md transition-all group"
+                      >
+                        <div className="bg-green-50 border-b border-green-200 px-3 py-2 flex justify-between items-center group-hover:bg-green-100 transition-colors">
+                          <h2 className="font-semibold text-green-800 text-sm flex items-center gap-1.5">
+                            <ExcelIcon /> 2️⃣ Offer Sheet
+                          </h2>
+                        </div>
+                        <div className="flex-grow flex flex-col items-center justify-center p-4 bg-slate-50 group-hover:bg-white transition-colors">
+                          <span className="text-sm font-bold text-slate-600 mb-1">Click to Open</span>
+                          {offerData.trim() && (
+                            <span className="mt-2 text-xs bg-green-100 text-green-700 px-2 py-1 rounded-full font-medium">Data Loaded ✓</span>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Box 3: Fair Health Modal Trigger */}
+                      <div 
+                        onClick={() => setShowFairHealthModal(true)}
+                        className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden flex flex-col w-1/2 cursor-pointer hover:border-blue-400 hover:shadow-md transition-all group"
+                      >
+                        <div className="bg-blue-50 border-b border-blue-200 px-3 py-2 flex justify-between items-center group-hover:bg-blue-100 transition-colors">
+                          <h2 className="font-semibold text-blue-800 text-sm flex items-center gap-1.5">
+                            <ExcelBlueIcon /> 3️⃣ Fair Health
+                          </h2>
+                        </div>
+                        <div className="flex-grow flex flex-col items-center justify-center p-4 bg-slate-50 group-hover:bg-white transition-colors">
+                          <span className="text-sm font-bold text-slate-600 mb-1">Click to Open</span>
+                          {fairHealthData.trim() && (
+                            <span className="mt-2 text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded-full font-medium">Data Loaded ✓</span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* NEW: Box 4 and Box 5 Placeholders */}
+                    <div className="flex gap-4">
+                      {/* Box 4: Placeholder */}
+                      <div className="bg-slate-50 rounded-xl shadow-sm border-2 border-dashed border-slate-300 overflow-hidden flex flex-col w-1/2 opacity-70">
+                        <div className="bg-slate-100/50 border-b border-slate-200/50 px-3 py-2">
+                          <h2 className="font-semibold text-slate-500 text-sm flex items-center gap-1.5">
+                            4️⃣ Custom Slot
+                          </h2>
+                        </div>
+                        <div className="flex-grow flex flex-col items-center justify-center p-4 text-center">
+                          <span className="text-xs font-bold text-slate-400 uppercase tracking-wide">Reserved</span>
+                          <span className="text-[10px] font-medium text-slate-400 mt-1">For Future Update</span>
+                        </div>
+                      </div>
+
+                      {/* Box 5: Placeholder */}
+                      <div className="bg-slate-50 rounded-xl shadow-sm border-2 border-dashed border-slate-300 overflow-hidden flex flex-col w-1/2 opacity-70">
+                        <div className="bg-slate-100/50 border-b border-slate-200/50 px-3 py-2">
+                          <h2 className="font-semibold text-slate-500 text-sm flex items-center gap-1.5">
+                            5️⃣ Custom Slot
+                          </h2>
+                        </div>
+                        <div className="flex-grow flex flex-col items-center justify-center p-4 text-center">
+                          <span className="text-xs font-bold text-slate-400 uppercase tracking-wide">Reserved</span>
+                          <span className="text-[10px] font-medium text-slate-400 mt-1">For Future Update</span>
+                        </div>
+                      </div>
+                    </div>
+
+                  </div>
+
+                  {/* Right Panel: Output */}
+                  <div className="xl:w-2/3 flex flex-col gap-6 w-full">
+                    
+                    {/* Data Table */}
+                    <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                      <div className="bg-blue-50 border-b border-blue-100 px-4 py-3 flex justify-between items-center">
+                        <h2 className="font-semibold text-blue-900 text-sm md:text-base">📊 Extracted Data Table</h2>
+                        <button 
+                          onClick={copyTableData}
+                          className="flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md transition-colors bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 shadow-sm"
+                        >
+                          <CopyIcon />
+                          Copy Data
+                        </button>
+                      </div>
+                      <div className="p-4 overflow-x-auto">
+                        <table className="w-full text-sm text-left border-collapse min-w-[800px]">
+                          <thead className="bg-slate-100 text-slate-600 uppercase text-xs">
+                            <tr>
+                              <th className="p-2 border border-slate-200">Ticket</th>
+                              <th className="p-2 border border-slate-200">Claim No</th>
+                              <th className="p-2 border border-slate-200">Total Bill</th>
+                              <th className="p-2 border border-slate-200">Obs. Bill</th>
+                              <th className="p-2 border border-slate-200">W/O Obs & Med</th>
+                              <th className="p-2 border border-slate-200">Initial Paid</th>
+                              <th className="p-2 border border-slate-200">Patient Share</th>
+                              <th className="p-2 border border-slate-200">Offer Amt</th>
+                              <th className="p-2 border border-slate-200">Add. Offer</th>
+                            </tr>
+                          </thead>
+                          <tbody className="text-slate-800 font-medium bg-white">
+                            <tr className="hover:bg-slate-50 transition-colors">
+                              <td className="p-2 border border-slate-200">{extracted.ticket || '-'}</td>
+                              <td className="p-2 border border-slate-200">{extracted.claimNo || '-'}</td>
+                              <td className="p-2 border border-slate-200 text-red-600">${extracted.totalBill || '0.00'}</td>
+                              <td className="p-2 border border-slate-200">${extracted.obsBill || '0.00'}</td>
+                              <td className="p-2 border border-slate-200 text-blue-700">${extracted.withoutObsMed || '0.00'}</td>
+                              <td className="p-2 border border-slate-200 text-emerald-600">${extracted.initialPaid || '0.00'}</td>
+                              <td className="p-2 border border-slate-200 font-medium text-amber-600">${extracted.patientShare || '0.00'}</td>
+                              <td className="p-2 border border-slate-200">${extracted.offerAmount || '0.00'}</td>
+                              <td className={`p-2 border border-slate-200 font-semibold ${extracted.addOfferFormatted?.includes('-') ? 'text-red-600' : ''}`}>{extracted.addOfferFormatted || '$0.00'}</td>
+                            </tr>
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    {/* Generated Note */}
+                    <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden flex flex-col">
+                       <div className="bg-slate-800 border-b border-slate-900 px-4 py-3 flex flex-col md:flex-row justify-between items-center gap-3">
+                        <div className="flex items-center gap-3">
+                          <select 
+                            className="bg-slate-700 text-white text-xs md:text-sm px-2 py-1 rounded border border-slate-600 focus:outline-none focus:ring-1 focus:ring-blue-400"
+                            value={noteType}
+                            onChange={(e) => setNoteType(e.target.value)}
+                          >
+                            <option value="default">Standard Follow-up (Waiting on FO)</option>
+                            <option value="different_plan">Different Health Plan (Ineligible)</option>
+                            <option value="accepted">Accepted Amount Received</option>
+                            <option value="withdrawn">Withdrawn from TDI</option>
+                            <option value="out_of_state">Out of State Final Review</option>
+                          </select>
+                        </div>
+                        <button 
+                          onClick={copyNoteData}
+                          className="flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md transition-colors bg-slate-700 text-white hover:bg-slate-600"
+                        >
+                          <CopyIcon />
+                          Copy Note
+                        </button>
+                      </div>
+                      <div className="p-4 bg-yellow-50/50">
+                        <textarea
+                          readOnly
+                          className="w-full h-32 p-3 text-sm font-semibold text-slate-800 bg-transparent border-none focus:outline-none resize-none uppercase"
+                          value={generatedNote}
+                        />
+                      </div>
+                    </div>
+
+                    {/* Provider Details & PO Box Validation */}
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                       <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200">
+                          <span className="text-xs font-semibold text-slate-400 uppercase block mb-1">NPI Number</span>
+                          <span className="text-base font-bold text-slate-700">{extracted.npi || 'N/A'}</span>
+                       </div>
+                       <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200">
+                          <span className="text-xs font-semibold text-slate-400 uppercase block mb-1">Tax ID (EIN)</span>
+                          <span className="text-base font-bold text-slate-700">{extracted.taxId || 'N/A'}</span>
+                       </div>
+                       {/* Fair Health 80th Box */}
+                       <div className="bg-blue-50 p-4 rounded-xl shadow-sm border border-blue-200">
+                          <span className="text-xs font-semibold text-blue-500 uppercase block mb-1">Fair Health 80th</span>
+                          <span className="text-base font-bold text-blue-800">${extracted.fairHealth80th || '0.00'}</span>
+                       </div>
+                       <div className="bg-white p-4 rounded-xl shadow-sm border border-slate-200">
+                          <span className="text-xs font-semibold text-slate-400 uppercase block mb-1">Service Codes</span>
+                          <span className="text-base font-bold text-slate-700 break-words">{extracted.serviceCodes || 'N/A'}</span>
+                       </div>
+                       
+                       <div className={`p-4 rounded-xl shadow-sm border flex items-start gap-3 md:col-span-4 ${extracted.isPoBox ? 'bg-red-50 border-red-200' : 'bg-green-50 border-green-200'}`}>
+                          {extracted.isPoBox ? <AlertIcon /> : <div className="text-green-600"><CheckIcon /></div>}
+                          <div>
+                            <span className="text-xs font-bold uppercase block mb-1 opacity-70">Address Validation</span>
+                            <span className="text-sm font-semibold block">{extracted.address || 'No Address Found'}</span>
+                            {extracted.isPoBox && (
+                              <p className="text-xs mt-1 font-medium text-red-800">
+                                ⚠️ PO Box detected! Ensure you use Corporate Mailing Address for TDI.
+                              </p>
+                            )}
+                          </div>
+                       </div>
+                    </div>
+
+                  </div>
+                </div>
+              </div>
+
+              {/* --- SECRET ADMIN POPUP --- */}
+              {secretPopup && (
+                <div className="fixed inset-0 bg-slate-900/60 flex items-center justify-center z-[100] backdrop-blur-sm">
+                  <div className="bg-slate-800 border border-slate-600 shadow-2xl rounded-2xl w-96 p-6 transform scale-100 transition-all">
+                    <div className="flex justify-between items-center mb-5">
+                      <h3 className="text-xl font-bold text-white flex items-center gap-2">
+                        🕵️ Secret Setup
+                      </h3>
+                      <button onClick={() => setSecretPopup(false)} className="text-slate-400 hover:text-red-400 text-lg transition-colors">✕</button>
+                    </div>
+                    
+                    <div className="flex flex-col gap-4">
+                      <div>
+                        <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1 block">Override Date (MM/DD/YY)</label>
+                        <input 
+                          type="text" 
+                          className="w-full bg-slate-700 text-white font-mono p-2.5 rounded-lg border border-slate-600 focus:outline-none focus:border-blue-500" 
+                          value={secretData.date} 
+                          onChange={e => setSecretData({...secretData, date: e.target.value})} 
+                        />
+                      </div>
+                      
+                      <div>
+                        <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1 block">Collector Initials</label>
+                        <input 
+                          type="text" 
+                          className="w-full bg-slate-700 text-white font-mono p-2.5 rounded-lg border border-slate-600 focus:outline-none focus:border-blue-500" 
+                          value={secretData.initial} 
+                          onChange={e => setSecretData({...secretData, initial: e.target.value})} 
+                        />
+                      </div>
+
+                      <div>
+                        <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1 flex justify-between">
+                          <span>Ticket ↔ Case/IDR Mapping</span>
+                          <span className="text-blue-400 normal-case">Paste Excel Data</span>
+                        </label>
+                        <textarea 
+                          className="w-full h-32 bg-slate-700 text-white font-mono p-2.5 rounded-lg border border-slate-600 focus:outline-none focus:border-blue-500 resize-none whitespace-pre overflow-auto text-sm" 
+                          value={secretData.ticketCaseMapping} 
+                          onChange={e => setSecretData({...secretData, ticketCaseMapping: e.target.value})} 
+                          placeholder="Paste Ticket and IDR Number columns here..."
+                        />
+                      </div>
+                      
+                      <button 
+                        onClick={() => {
+                          setSecretPopup(false);
+                          addNotification("Settings updated successfully!", "success");
+                        }} 
+                        className="mt-3 bg-blue-600 hover:bg-blue-500 text-white py-2.5 rounded-lg font-bold tracking-wide transition-colors"
+                      >
+                        Apply & Hide
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* --- OFFER SPREADSHEET MODAL --- */}
+              {showOfferModal && (
+                <div className="fixed inset-0 bg-slate-900/60 flex items-center justify-center z-[90] backdrop-blur-sm p-4 md:p-10">
+                  <div className="bg-white border border-slate-300 shadow-2xl rounded-xl w-full max-w-5xl h-[80vh] flex flex-col overflow-hidden">
+                    <div className="bg-[#107c41] px-4 py-3 flex justify-between items-center text-white">
+                      <h3 className="text-lg font-bold flex items-center gap-2">
+                        <ExcelIcon /> Offer Sheet Tracker
+                      </h3>
+                      <div className="flex gap-3">
+                        <button 
+                          onClick={() => setShowOfferModal(false)}
+                          className="bg-white/20 hover:bg-white/30 px-4 py-1.5 rounded text-sm font-semibold transition-colors"
+                        >
+                          Save & Close
+                        </button>
+                      </div>
+                    </div>
+                    <div className="flex flex-col flex-grow p-4 gap-4 bg-slate-50 overflow-hidden">
+                      <div className="flex flex-col gap-1">
+                        <label className="text-sm font-semibold text-slate-700">Paste your Excel/TSV Data here:</label>
+                        <textarea
+                          className="w-full h-32 p-3 text-sm text-slate-800 bg-white border border-slate-300 rounded focus:ring-2 focus:ring-green-500 focus:outline-none resize-none font-mono whitespace-pre shadow-inner"
+                          placeholder="Paste directly from Excel..."
+                          value={offerData}
+                          onChange={(e) => setOfferData(e.target.value)}
+                        />
+                      </div>
+                      <div className="flex flex-col flex-grow overflow-hidden border border-slate-300 rounded bg-white shadow-sm">
+                        <div className="bg-slate-100 border-b border-slate-300 px-3 py-1.5 text-xs font-bold text-slate-500 uppercase tracking-wider">
+                          Live Spreadsheet Preview
+                        </div>
+                        <div className="overflow-auto flex-grow p-0">
+                          <table className="w-full text-sm text-left border-collapse whitespace-nowrap">
+                            <tbody className="text-slate-700">
+                              {offerData.split('\n').filter(line => line.trim() !== '').map((row, rowIndex) => (
+                                <tr key={rowIndex} className="border-b border-slate-200 hover:bg-slate-50">
+                                  <td className="bg-slate-100 border-r border-slate-300 w-8 text-center text-xs font-bold text-slate-400 select-none">
+                                    {rowIndex + 1}
+                                  </td>
+                                  {row.split('\t').map((cell, cellIndex) => (
+                                    <td key={cellIndex} className="p-2 border-r border-slate-200 last:border-r-0">
+                                      {cell}
+                                    </td>
+                                  ))}
+                                </tr>
+                              ))}
+                              {offerData.trim() === '' && (
+                                <tr>
+                                  <td className="p-8 text-center text-slate-400 font-medium" colSpan="100%">
+                                    No data pasted yet. Paste from Excel to see the preview.
+                                  </td>
+                                </tr>
+                              )}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* --- FAIR HEALTH SPREADSHEET MODAL --- */}
+              {showFairHealthModal && (
+                <div className="fixed inset-0 bg-slate-900/60 flex items-center justify-center z-[90] backdrop-blur-sm p-4 md:p-10">
+                  <div className="bg-white border border-slate-300 shadow-2xl rounded-xl w-full max-w-5xl h-[80vh] flex flex-col overflow-hidden">
+                    <div className="bg-[#0078d4] px-4 py-3 flex justify-between items-center text-white">
+                      <h3 className="text-lg font-bold flex items-center gap-2">
+                        <ExcelBlueIcon /> Fair Health Data
+                      </h3>
+                      <div className="flex gap-3">
+                        <button 
+                          onClick={() => setShowFairHealthModal(false)}
+                          className="bg-white/20 hover:bg-white/30 px-4 py-1.5 rounded text-sm font-semibold transition-colors"
+                        >
+                          Save & Close
+                        </button>
+                      </div>
+                    </div>
+                    <div className="flex flex-col flex-grow p-4 gap-4 bg-slate-50 overflow-hidden">
+                      <div className="flex flex-col gap-1">
+                        <label className="text-sm font-semibold text-slate-700">Paste your Fair Health Excel Data here (include headers):</label>
+                        <textarea
+                          className="w-full h-32 p-3 text-sm text-slate-800 bg-white border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 focus:outline-none resize-none font-mono whitespace-pre shadow-inner"
+                          placeholder="Paste directly from Excel (Make sure 'Code' and '80th' columns are present)..."
+                          value={fairHealthData}
+                          onChange={(e) => setFairHealthData(e.target.value)}
+                        />
+                      </div>
+                      <div className="flex flex-col flex-grow overflow-hidden border border-slate-300 rounded bg-white shadow-sm">
+                        <div className="bg-slate-100 border-b border-slate-300 px-3 py-1.5 text-xs font-bold text-slate-500 uppercase tracking-wider">
+                          Live Spreadsheet Preview
+                        </div>
+                        <div className="overflow-auto flex-grow p-0">
+                          <table className="w-full text-sm text-left border-collapse whitespace-nowrap">
+                            <tbody className="text-slate-700">
+                              {fairHealthData.split('\n').filter(line => line.trim() !== '').map((row, rowIndex) => (
+                                <tr key={rowIndex} className="border-b border-slate-200 hover:bg-slate-50">
+                                  <td className="bg-slate-100 border-r border-slate-300 w-8 text-center text-xs font-bold text-slate-400 select-none">
+                                    {rowIndex + 1}
+                                  </td>
+                                  {row.split('\t').map((cell, cellIndex) => (
+                                    <td key={cellIndex} className="p-2 border-r border-slate-200 last:border-r-0">
+                                      {cell}
+                                    </td>
+                                  ))}
+                                </tr>
+                              ))}
+                              {fairHealthData.trim() === '' && (
+                                <tr>
+                                  <td className="p-8 text-center text-slate-400 font-medium" colSpan="100%">
+                                    No data pasted yet. Paste from Excel to see the preview.
+                                  </td>
+                                </tr>
+                              )}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+            </div>
+          );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<TdiDashboard />);
+    </script>
+</body>
+</html>
